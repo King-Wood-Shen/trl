@@ -13,8 +13,12 @@
 # limitations under the License.
 
 import gc
+import hashlib
+import importlib.metadata
+import json
 import math
 import os
+import sys
 import textwrap
 import time
 from collections import defaultdict
@@ -28,7 +32,7 @@ import torch.nn as nn
 from accelerate import Accelerator, logging
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from transformers import (
     BaseImageProcessor,
     DataCollatorWithPadding,
@@ -73,6 +77,149 @@ if is_peft_available():
 
 
 INVALID_LOGPROB = 1.0
+PPO_RESUME_STATE_NAME = "ppo_resume_state.json"
+PPO_RESUME_SEMANTIC_ARGS = (
+    "exp_name", "reward_model_path", "sft_model_path", "model_adapter_name", "ref_adapter_name",
+    "num_ppo_epochs", "num_mini_batches", "local_rollout_forward_batch_size", "num_sample_generations",
+    "response_length", "stop_token", "stop_token_id", "temperature", "missing_eos_penalty",
+    "whiten_rewards", "kl_coef", "kl_estimator", "cliprange", "vf_coef", "cliprange_value", "gamma", "lam",
+    "batch_size", "local_batch_size", "local_mini_batch_size", "mini_batch_size", "micro_batch_size",
+    "per_device_train_batch_size", "gradient_accumulation_steps", "seed", "data_seed",
+    "optim", "learning_rate", "weight_decay", "adam_beta1", "adam_beta2", "adam_epsilon",
+    "max_grad_norm", "optim_args", "lr_scheduler_type", "lr_scheduler_kwargs", "warmup_steps", "warmup_ratio",
+    "max_steps", "optimizer",
+    "fp16", "bf16", "tf32", "gradient_checkpointing", "model_type", "task_type", "train_type",
+    "tuner_type", "tuner_backend", "lora_rank", "lora_alpha", "lora_dropout", "target_modules",
+    "modules_to_save", "use_dora", "use_rslora", "freeze_llm", "freeze_vit", "freeze_aligner",
+    "quantization_bit", "dtype", "attn_impl", "padding_side", "max_length", "truncation_strategy",
+    "per_device_eval_batch_size", "eval_strategy", "evaluation_strategy", "eval_steps",
+    "save_strategy", "save_steps", "logging_strategy", "logging_steps",
+)
+
+
+class _ResumableRandomSampler(Sampler):
+    def __init__(self, dataset, seed, batch_size):
+        self.dataset, self.batch_size = dataset, batch_size
+        self.generator = torch.Generator(device="cpu").manual_seed(seed)
+        self.epoch, self.cursor, self.permutation = 0, 0, None
+
+    @property
+    def usable_length(self):
+        return len(self.dataset) // self.batch_size * self.batch_size
+
+    def __iter__(self):
+        if self.permutation is None:
+            self.permutation = torch.randperm(len(self.dataset), generator=self.generator).tolist()
+        return iter(self.permutation[self.cursor:self.usable_length])
+
+    def __len__(self):
+        return self.usable_length - self.cursor
+
+    def mark_batch_delivered(self, count):
+        self.cursor += count
+        if self.cursor >= self.usable_length:
+            self.epoch, self.cursor, self.permutation = self.epoch + 1, 0, None
+
+    def state_dict(self):
+        return {"epoch": self.epoch, "cursor": self.cursor, "permutation": self.permutation,
+                "generator_state": self.generator.get_state().tolist()}
+
+    def load_state_dict(self, state):
+        perm = state["permutation"]
+        if perm is not None and sorted(perm) != list(range(len(self.dataset))):
+            raise ValueError("PPO sampler permutation does not match dataset")
+        epoch, cursor = int(state["epoch"]), int(state["cursor"])
+        if epoch < 0 or cursor < 0 or cursor >= self.usable_length or (perm is None and cursor):
+            raise ValueError("Invalid PPO sampler epoch/cursor")
+        self.epoch, self.cursor, self.permutation = epoch, cursor, perm
+        self.generator.set_state(torch.tensor(state["generator_state"], dtype=torch.uint8))
+
+
+def _dataset_content_hash(dataset):
+    digest = hashlib.sha256()
+    for row in dataset:
+        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
+        digest.update(bytes([10]))
+    return digest.hexdigest()
+
+
+def _adapter_source_identity(source):
+    root = Path(source).resolve()
+    config = root / "adapter_config.json"
+    if not config.is_file():
+        config = root / "default" / "adapter_config.json"
+    if not config.is_file():
+        raise ValueError(f"PPO adapter has no recognized config: {root}")
+    root = config.parent
+    files = {config}
+    weights = set()
+    for name in ("adapter_model.safetensors", "adapter_model.bin", "pytorch_model.bin", "model.safetensors"):
+        path = root / name
+        if path.is_file():
+            weights.add(path)
+        index = root / (name + ".index.json")
+        if index.is_file():
+            files.add(index)
+            with index.open(encoding="utf-8") as handle:
+                weight_map = json.load(handle)["weight_map"]
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError(f"PPO adapter has an invalid weight index: {index}")
+            for filename in weight_map.values():
+                path = (root / filename).resolve()
+                if root not in path.parents or not path.is_file():
+                    raise ValueError(f"PPO adapter shard is missing or outside its root: {filename}")
+                weights.add(path)
+    if not weights:
+        raise ValueError(f"PPO adapter has no recognized weights: {root}")
+    files.update(weights)
+    result = {}
+    for path in sorted(files):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        result[path.relative_to(root).as_posix()] = digest.hexdigest()
+    return {"files_sha256": result}
+
+
+def _model_source_identity(model):
+    model = getattr(model, "policy", model)
+    config = getattr(model, "config", None)
+    source = getattr(config, "_name_or_path", None) or getattr(config, "name_or_path", None)
+    identity = {"source": str(source) if source else None, "files_sha256": {}}
+    if source and Path(source).is_dir():
+        relevant = (
+            "config.json", "model.safetensors.index.json", "pytorch_model.bin.index.json",
+            "model.safetensors", "pytorch_model.bin", "adapter_model.safetensors",
+            "adapter_model.bin",
+        )
+        candidates = []
+        for name in relevant:
+            candidates.extend(Path(source).glob(name))
+        candidates.extend(Path(source).glob("model-*.safetensors"))
+        candidates.extend(Path(source).glob("pytorch_model-*.bin"))
+        for path in sorted(set(candidates)):
+            h = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    h.update(chunk)
+            identity["files_sha256"][path.name] = h.hexdigest()
+    adapter_sources = getattr(model, '_swift_ppo_adapter_sources', ())
+    if adapter_sources:
+        identity['adapters'] = [_adapter_source_identity(source) for source in adapter_sources]
+    return identity
+
+
+def _jsonable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in sorted(value.items(), key=lambda pair: str(pair[0]))}
+    if hasattr(value, "value"):
+        return _jsonable(value.value)
+    return str(value)
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None) -> torch.Tensor:
@@ -346,13 +493,29 @@ class PPOTrainer(BaseTrainer):
         #########
         # setup dataloader
         #########
-        self.dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=self.local_dataloader_batch_size,
-            shuffle=True,
-            collate_fn=self.data_collator,
-            drop_last=True,  # needed; otherwise the last batch will be of ragged shape
-        )
+        if self.accelerator.num_processes == 1:
+            self._ppo_sampler = _ResumableRandomSampler(
+                self.train_dataset, args.seed, self.local_dataloader_batch_size
+            )
+            self._ppo_dataloader_generator = torch.Generator(device="cpu").manual_seed(args.seed + 1)
+            self.dataloader = DataLoader(
+                self.train_dataset,
+                batch_size=self.local_dataloader_batch_size,
+                sampler=self._ppo_sampler,
+                collate_fn=self.data_collator,
+                drop_last=True,
+                generator=self._ppo_dataloader_generator,
+            )
+        else:
+            self._ppo_sampler = None
+            self._ppo_dataloader_generator = None
+            self.dataloader = DataLoader(
+                self.train_dataset,
+                batch_size=self.local_dataloader_batch_size,
+                shuffle=True,
+                collate_fn=self.data_collator,
+                drop_last=True,
+            )
         # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
         # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
         torch.manual_seed(args.seed)
@@ -422,7 +585,7 @@ class PPOTrainer(BaseTrainer):
         if self.is_deepspeed_enabled:
             self.deepspeed = backup_deepspeed
 
-    def train(self):
+    def train(self, resume_from_checkpoint: str | None = None):
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -433,11 +596,7 @@ class PPOTrainer(BaseTrainer):
         dataloader = self.dataloader
         device = accelerator.device
 
-        def repeat_generator():
-            while True:
-                yield from dataloader
-
-        iter_dataloader = iter(repeat_generator())
+        dataloader_iterator = None
         generation_config = GenerationConfig(
             max_new_tokens=args.response_length,
             temperature=(args.temperature + 1e-7),
@@ -458,11 +617,56 @@ class PPOTrainer(BaseTrainer):
         ratio_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
-        # trainer state initialization
-        self.state.global_step = 0
-        self.state.episode = 0
+        resume_rng_path = None
+        if resume_from_checkpoint is None:
+            self.state.global_step, self.state.episode, self._ppo_resume_step = 0, 0, 0
+        else:
+            if self.accelerator.num_processes != 1:
+                raise ValueError("PPO exact resume currently supports single-process training only")
+            path = Path(resume_from_checkpoint)
+            sidecar = path / PPO_RESUME_STATE_NAME
+            if not path.is_dir() or not sidecar.is_file():
+                raise ValueError(f"Missing PPO resume sidecar: {sidecar}")
+            with sidecar.open(encoding="utf-8") as f:
+                saved = json.load(f)
+            self._validate_ppo_resume_state(saved)
+            required_files = ("optimizer.pt", "scheduler.pt", "rng_state.pth", "trainer_state.json")
+            missing_files = [name for name in required_files if not (path / name).is_file()]
+            if missing_files:
+                raise ValueError(f"Incomplete PPO resume checkpoint; missing: {', '.join(missing_files)}")
+            scaler_path = path / "scaler.pt"
+            has_scaler = getattr(self.accelerator, "scaler", None) is not None
+            if has_scaler and not scaler_path.is_file():
+                raise ValueError(f"Incomplete PPO resume checkpoint; missing {scaler_path}")
+            self._load_from_checkpoint(str(path))
+            self._load_optimizer_and_scheduler(str(path))
+            if has_scaler:
+                self._load_scaler(str(path))
+            state_path = path / "trainer_state.json"
+            self.state = type(self.state).load_from_json(str(state_path))
+            if int(self.state.episode) != int(saved["episode"]):
+                raise ValueError("PPO resume metadata/trainer_state episode mismatch")
+            self._load_callback_state()
+            self._ppo_sampler.load_state_dict(saved["sampler"])
+            self._ppo_dataloader_generator.set_state(torch.tensor(saved["dataloader_generator_state"], dtype=torch.uint8))
+            self._ppo_resume_step = int(self.state.global_step)
+            if self._ppo_resume_step != int(saved["global_step"]):
+                raise ValueError("PPO resume metadata/trainer_state step mismatch")
+            if int(args.num_total_batches) <= self._ppo_resume_step:
+                raise ValueError("num_total_batches must exceed checkpoint step")
+            resume_rng_path = str(path)
         self.state.max_steps = args.num_total_batches
         self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
+        dataloader_iterator = iter(dataloader)
+        def repeat_generator():
+            nonlocal dataloader_iterator
+            while True:
+                try:
+                    yield next(dataloader_iterator)
+                except StopIteration:
+                    dataloader_iterator = iter(dataloader)
+
+        iter_dataloader = repeat_generator()
         # Compute absolute values for logging, eval, and save if given as ratio
         if args.logging_steps is not None:
             if args.logging_steps < 1:
@@ -480,15 +684,19 @@ class PPOTrainer(BaseTrainer):
             else:
                 self.state.save_steps = args.save_steps
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        if resume_rng_path is not None:
+            self._load_rng_state(resume_rng_path)
 
         # backward compatibility
         if self.is_deepspeed_enabled:
             self.deepspeed = self.model
             self.model_wrapped = self.model
 
-        for update in range(1, args.num_total_batches + 1):
-            self.state.episode += 1 * args.batch_size
+        for update in range(self._ppo_resume_step + 1, args.num_total_batches + 1):
             data = next(iter_dataloader)
+            if self._ppo_sampler is not None:
+                self._ppo_sampler.mark_batch_delivered(int(data["input_ids"].shape[0]))
+            self.state.episode += args.batch_size
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
@@ -755,6 +963,8 @@ class PPOTrainer(BaseTrainer):
                 returns,
             )
             empty_cache()
+            if self.control.should_training_stop:
+                break
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
@@ -826,6 +1036,63 @@ class PPOTrainer(BaseTrainer):
                     table=df,
                 )
 
+    def _ppo_resume_metadata(self):
+        args = {
+            name: _jsonable(getattr(self.args, name))
+            for name in PPO_RESUME_SEMANTIC_ARGS
+            if hasattr(self.args, name)
+        }
+        result = {
+            "format_version": 1, "global_step": int(self.state.global_step),
+            "episode": int(self.state.episode), "world_size": int(self.accelerator.num_processes),
+            "dataset_length": len(self.train_dataset), "dataset_sha256": _dataset_content_hash(self.train_dataset),
+            "model_source": _model_source_identity(self.model),
+            "reward_source": _model_source_identity(self.reward_model),
+            "ppo_args": args,
+            "versions": {
+                **{n: importlib.metadata.version(n) for n in ("trl", "transformers", "accelerate", "datasets")},
+                "peft": importlib.metadata.version("peft") if is_peft_available() else None,
+                "torch": str(torch.__version__),
+                "swift": getattr(sys.modules.get("swift"), "__version__", None),
+            },
+            "sampler": self._ppo_sampler.state_dict(),
+            "dataloader_generator_state": self._ppo_dataloader_generator.get_state().tolist(),
+        }
+        if self.ref_model is not None:
+            result['reference_source'] = _model_source_identity(self.ref_model)
+        return result
+
+    def _validate_ppo_resume_state(self, saved):
+        if saved.get("format_version") != 1:
+            raise ValueError("Unsupported PPO resume metadata version")
+        if saved.get("world_size") != self.accelerator.num_processes or self.accelerator.num_processes != 1:
+            raise ValueError("PPO resume world size mismatch; exact resume requires single process")
+        if saved.get("dataset_length") != len(self.train_dataset) or saved.get("dataset_sha256") != _dataset_content_hash(self.train_dataset):
+            raise ValueError("PPO resume dataset identity mismatch")
+        if saved.get("model_source") != _model_source_identity(self.model):
+            raise ValueError("PPO resume policy model identity mismatch")
+        if saved.get("reward_source") != _model_source_identity(self.reward_model):
+            raise ValueError("PPO resume reward model identity mismatch")
+        reference_source = (_model_source_identity(self.ref_model)
+                            if self.ref_model is not None else None)
+        if saved.get("reference_source") != reference_source:
+            raise ValueError("PPO resume reference model identity mismatch")
+        args = {
+            name: _jsonable(getattr(self.args, name))
+            for name in PPO_RESUME_SEMANTIC_ARGS
+            if hasattr(self.args, name)
+        }
+        if saved.get("ppo_args") != args:
+            raise ValueError("PPO resume training arguments mismatch")
+        versions = {
+            **{n: importlib.metadata.version(n) for n in ("trl", "transformers", "accelerate", "datasets")},
+            "peft": importlib.metadata.version("peft") if is_peft_available() else None,
+            "torch": str(torch.__version__),
+            "swift": getattr(sys.modules.get("swift"), "__version__", None),
+        }
+        if saved.get("versions") != versions:
+            raise ValueError("PPO resume software versions mismatch")
+
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
         if self.args.hub_model_id is None:
@@ -834,3 +1101,16 @@ class PPOTrainer(BaseTrainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
+        if (
+            self.accelerator.num_processes == 1
+            and not self.args.save_only_model
+            and self.accelerator.is_main_process
+        ):
+            checkpoint_dir = Path(self._get_output_dir(trial)) / f"checkpoint-{self.state.global_step}"
+            temporary_path = checkpoint_dir / f".{PPO_RESUME_STATE_NAME}.tmp"
+            with temporary_path.open("w", encoding="utf-8") as f:
+                json.dump(self._ppo_resume_metadata(), f, sort_keys=True, indent=2)
+                f.write(chr(10))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, checkpoint_dir / PPO_RESUME_STATE_NAME)
